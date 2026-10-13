@@ -270,6 +270,7 @@ def bench(
     every cell warms up, and non-distilled checkpoints use MagCache from the
     checkpoint file. Profile mode is ``time_mem_module``. JSON files go to
     ``profiles/`` inside ``$KANDINSKY_HOME/outputs/bench_<date-time>/``.
+    That folder also receives ``module-time-report.html``.
     ``--gpu`` selects one card. When it is omitted, the first free GPU is used.
     """
     from kandinsky.bench import run

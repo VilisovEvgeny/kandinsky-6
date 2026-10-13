@@ -4,7 +4,8 @@ Lite and Pro, distilled and not, at SD, HD, and Full HD. Each checkpoint is
 loaded once and reused for its three resolutions. Compile is torch, every cell
 warms up, and non-distilled checkpoints use the MagCache block from their
 checkpoint file. Profile mode is ``time_mem_module``. JSON files go to
-``profiles/`` inside the run folder.
+``profiles/`` inside the run folder. The same folder receives
+``module-time-report.html`` after the cells finish.
 
 HD and Full HD match the performance report: the base clip is super-resolved
 with the distilled 2-step VSR model. t2v here is text to video with audio and
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import yaml
 
+from kandinsky.bench_report import write_module_time_report
 from kandinsky.pipeline.config import load_config
 from kandinsky.runtime.home import kandinsky_home
 
@@ -443,4 +445,6 @@ def run(
     wall_started = time.monotonic()
     results = _execute(groups, text, seed, run_dir, gpu_id)
     ok = _print_summary(results, time.monotonic() - wall_started, run_dir, profiles)
+    report = write_module_time_report(run_dir)
+    print("Report: no profiles" if report is None else f"Report: {report}")
     return 0 if ok else 1
