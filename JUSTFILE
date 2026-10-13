@@ -24,6 +24,15 @@ generate-sr *ARGS:
 download NAME *ARGS:
     @uv run kandy download {{NAME}} {{ARGS}}
 
+# Each checkpoint stays loaded for its three resolutions. Compile and warmup
+# are on. Non-distilled checkpoints use MagCache from the checkpoint file.
+# HD and Full HD include super-resolution. Profile JSON files go to
+# profiles/ inside the run folder.
+# just bench
+# Twelve t2v timings on one GPU: Lite/Pro, distilled and not, SD/HD/Full HD. just bench [--gpu 0]
+bench *ARGS:
+    @uv run kandy bench {{ARGS}}
+
 # vLLM 0.31.0 and vLLM-Omni main, in .venvs/vllm-omni. Separate from `just setup`.
 setup-vllm:
     #!/usr/bin/env bash

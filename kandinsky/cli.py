@@ -256,6 +256,28 @@ def _super_resolve_if_enabled(  # noqa: PLR0913
 
 
 @app.command
+def bench(
+    *,
+    gpu: int | None = None,
+    prompt: str | None = None,
+    seed: int = 0,
+    mem_threshold: int = 1000,
+) -> None:
+    """Time twelve t2v generations on one GPU.
+
+    Lite and Pro, distilled and not, at SD, HD, and Full HD. Each checkpoint
+    is loaded once and reused for its three resolutions. Compile is torch,
+    every cell warms up, and non-distilled checkpoints use MagCache from the
+    checkpoint file. Profile mode is ``time_mem_module``. JSON files go to
+    ``profiles/`` inside ``$KANDINSKY_HOME/outputs/bench_<date-time>/``.
+    ``--gpu`` selects one card. When it is omitted, the first free GPU is used.
+    """
+    from kandinsky.bench import run
+
+    raise SystemExit(run(gpu=gpu, prompt=prompt, seed=seed, mem_threshold=mem_threshold))
+
+
+@app.command
 def download(name: str, *, cache_dir: str | None = None) -> None:
     """Download a catalog snapshot when it is not already on disk.
 
