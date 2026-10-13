@@ -17,9 +17,10 @@ generate PROMPT *ARGS:
 generate-sr *ARGS:
     @uv run kandy-sr {{ARGS}}
 
-# Download a catalog snapshot into $KANDINSKY_HOME/weights.
+# Download catalog snapshots into $KANDINSKY_HOME/weights.
 # pro, pro-distill, pro-pretrain, lite, lite-distill, lite-pretrain.
 # just download pro-distill
+# just download lite pro
 # just download pro-distill --cache-dir /path/to/weights
 download NAME *ARGS:
     @uv run kandy download {{NAME}} {{ARGS}}

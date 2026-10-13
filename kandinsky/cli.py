@@ -278,16 +278,22 @@ def bench(
 
 
 @app.command
-def download(name: str, *, cache_dir: str | None = None) -> None:
-    """Download a catalog snapshot when it is not already on disk.
+def download(*names: str, cache_dir: str | None = None) -> None:
+    """Download catalog snapshots when they are not already on disk.
 
-    ``name`` is one of ``pro``, ``pro-distill``, ``pro-pretrain``, ``lite``,
-    ``lite-distill``, ``lite-pretrain``. The snapshot goes to
+    Each name is one of ``pro``, ``pro-distill``, ``pro-pretrain``, ``lite``,
+    ``lite-distill``, ``lite-pretrain``. Snapshots go to
     ``$KANDINSKY_HOME/weights``, or to ``--cache-dir``.
     """
-    from kandinsky.runtime.weights import ensure_checkpoint
+    from kandinsky.runtime.weights import CHECKPOINTS, ensure_checkpoint, get_checkpoint
 
-    print(ensure_checkpoint(name, cache_dir=cache_dir))
+    if not names:
+        known = ", ".join(CHECKPOINTS)
+        raise ValueError(f"pass at least one checkpoint name; known: {known}")
+    for name in names:
+        get_checkpoint(name)
+    for name in names:
+        print(ensure_checkpoint(name, cache_dir=cache_dir))
 
 
 @app.command

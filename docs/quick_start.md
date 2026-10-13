@@ -27,9 +27,10 @@ Ampere, Ada, and consumer Blackwell compile SageAttention, so `nvcc` has to be o
 
 ```bash
 just download pro-distill
+just download lite pro
 ```
 
-Downloads one catalog snapshot into `$KANDINSKY_HOME/weights` when it is not already there. Names: `pro`, `pro-distill`, `pro-pretrain`, `lite`, `lite-distill`, `lite-pretrain`.
+Downloads each named catalog snapshot into `$KANDINSKY_HOME/weights` when it is not already there. Names: `pro`, `pro-distill`, `pro-pretrain`, `lite`, `lite-distill`, `lite-pretrain`.
 
 ```bash
 just download pro-distill --cache-dir /path/to/weights
