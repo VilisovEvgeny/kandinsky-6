@@ -72,10 +72,14 @@ _CSS = f"""
   table {{ width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }}
   th, td {{ padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }}
   thead th {{ font-weight: 650; background: var(--head); }}
+  thead th.group {{ text-align: center; }}
+  thead th.corner {{ text-align: left; vertical-align: bottom; }}
+  th.split, td.split {{ border-left: 1px solid var(--line); }}
   tbody th {{ text-align: left; font-weight: 600; background: var(--card); min-width: 168px; }}
   .run {{ display: block; }}
   .sub {{ display: block; margin-top: 2px; color: var(--muted); font-weight: 450; font-size: 11px; }}
   td {{ font-weight: 650; }}
+  td.missing {{ color: var(--muted); font-weight: 450; }}
   .share, .scale span {{ background: var(--heat); color: var(--on); }}
   .scale {{ display: flex; gap: 4px; margin-top: 10px; max-width: 520px; }}
   .scale span {{ flex: 1; text-align: center; font-size: 11px; font-weight: 650; padding: 6px 0; border-radius: 6px; }}
@@ -233,6 +237,17 @@ def _combine(name: str, payloads: list[dict], seconds: float | None) -> dict | N
     payload = paired[-1][0]
     run = payload.get("run") if isinstance(payload.get("run"), dict) else {}
     environment = payload.get("environment") if isinstance(payload.get("environment"), dict) else {}
+    memory = {
+        "generate": _max_peak(_peak_pair(item, "total_peak_allocated_mem", "total_peak_reserved_mem") for item, _call in paired),
+        "sr": _max_peak(_peak_pair(item, "sr_peak_allocated_mem", "sr_peak_reserved_mem") for item, _call in paired),
+    }
+    gpu_bytes = _max_peak(
+        (
+            (0, int(env["gpu_total_mem"]))
+            for item, _call in paired
+            if isinstance((env := item.get("environment")), dict) and isinstance(env.get("gpu_total_mem"), int)
+        )
+    )
     if seconds is None:
         totals = []
         for call_payload, call in paired:
@@ -253,6 +268,9 @@ def _combine(name: str, payloads: list[dict], seconds: float | None) -> dict | N
         "guidance": run.get("guidance_weight"),
         "cache": run.get("cache_mode"),
         "gpu": environment.get("gpu"),
+        "offload": run.get("offload_strategy") or "",
+        "memory": memory,
+        "gpu_bytes": 0 if gpu_bytes is None else gpu_bytes[1],
     }
 
 
@@ -443,6 +461,98 @@ def _table(rows: list[dict], columns: list[str]) -> str:
     )
 
 
+def _peak_pair(payload: dict, allocated_key: str, reserved_key: str) -> tuple[int, int] | None:
+    measurements = payload.get("measurements")
+    if not isinstance(measurements, dict):
+        return None
+    allocated = measurements.get(allocated_key)
+    reserved = measurements.get(reserved_key)
+    if not isinstance(allocated, (int, float)) or not isinstance(reserved, (int, float)):
+        return None
+    return int(allocated), int(reserved)
+
+
+def _max_peak(pairs) -> tuple[int, int] | None:
+    present = [pair for pair in pairs if pair is not None]
+    if not present:
+        return None
+    return max(pair[0] for pair in present), max(pair[1] for pair in present)
+
+
+def _gib(value: int) -> str:
+    return f"{value / 1024**3:.1f}"
+
+
+def _memory_table(rows: list[dict]) -> str:
+    """Maximum allocated and reserved high-water for the generation and for SR."""
+    gpu_bytes = max((row.get("gpu_bytes") or 0 for row in rows), default=0)
+    peaks = [
+        value
+        for row in rows
+        for pair in (row.get("memory") or {}).values()
+        if pair is not None
+        for value in pair
+    ]
+    scale = gpu_bytes or (max(peaks) if peaks else 0)
+
+    def value_cell(value: int | None, *, split: bool = False) -> str:
+        classes = ["split"] if split else []
+        if value is None:
+            classes.append("missing")
+            class_attr = f' class="{" ".join(classes)}"' if classes else ""
+            return f"<td{class_attr}>—</td>"
+        share = value / scale * 100.0 if scale else 0.0
+        classes.append("share")
+        tip = f"{value / 1024**3:.2f} GiB"
+        return (
+            f'<td class="{" ".join(classes)}" style="{_heat_style(share)}" '
+            f'title="{html.escape(tip)}">{_gib(value)}</td>'
+        )
+
+    def pair_cells(pair: tuple[int, int] | None, *, split: bool = False) -> str:
+        if pair is None:
+            return value_cell(None, split=split) + value_cell(None)
+        return value_cell(pair[0], split=split) + value_cell(pair[1])
+
+    body = []
+    for row in rows:
+        memory = row.get("memory") or {}
+        offload = str(row.get("offload") or "")
+        sub = f'<span class="sub">{html.escape(offload)}</span>' if offload else ""
+        body.append(
+            "<tr>"
+            f'<th scope="row"><span class="run">{html.escape(row["name"])}</span>{sub}</th>'
+            f'{pair_cells(memory.get("generate"))}{pair_cells(memory.get("sr"), split=True)}'
+            "</tr>"
+        )
+    if gpu_bytes:
+        color = f"that value as a share of this GPU ({gpu_bytes / 1024**3:.0f} GiB)"
+    else:
+        color = "that value as a share of the largest number in this table"
+    lead = (
+        "Each number is the maximum high-water across repetitions, in GiB. "
+        f"The color is {color}. "
+        "<code>generate</code> is the profiled generation, including the gaps between modules. "
+        "<code>sr</code> is the whole super-resolution stage, including weight load and kernel warmup. "
+        "A dash means that peak was not recorded."
+    )
+    header = (
+        "<thead>"
+        '<tr><th rowspan="2" class="corner">run</th>'
+        '<th colspan="2" class="group">generate</th>'
+        '<th colspan="2" class="group split">sr</th></tr>'
+        "<tr><th>allocated</th><th>reserved</th>"
+        '<th class="split">allocated</th><th>reserved</th></tr>'
+        "</thead>"
+    )
+    return (
+        "<h2>Peak memory, GiB</h2>"
+        f'<p class="lead">{lead}</p>'
+        '<div class="table-wrap"><table>'
+        f"{header}<tbody>{''.join(body)}</tbody></table></div>"
+    )
+
+
 def _scale() -> str:
     parts = [f'<span style="{_heat_style(float(value))}">{value}%</span>' for value in (0, 10, 25, 50, 75, 100)]
     return f'<div class="scale">{"".join(parts)}</div>'
@@ -476,6 +586,7 @@ def _page(run_name: str, rows: list[dict]) -> str:
   {_table(rows, columns)}
   {_scale()}
   <p class="note">Cell color is the size of the percentage. Hover a cell or a sector to see the median seconds. The line under a run name is the median of the full runs.</p>
+  {_memory_table(rows)}
 </main>
 </body>
 </html>

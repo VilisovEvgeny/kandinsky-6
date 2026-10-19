@@ -71,12 +71,13 @@ def test_report_orders_distill_then_lite_then_pro(tmp_path: Path) -> None:
         "lite-sd",
         "pro-sd",
     ]
-    assert re.findall(r'<span class="run">(.*?)</span>', text) == [
+    names = [
         "lite-distill-fhd",
         "pro-distill-hd",
         "lite-sd",
         "pro-sd",
     ]
+    assert re.findall(r'<span class="run">(.*?)</span>', text) == names + names
     assert text.count(f'fill="{_DIT}"') == 4
 
 
@@ -148,6 +149,49 @@ def test_module_shares_are_medians_across_the_recorded_repetitions(tmp_path: Pat
     assert "90.9" in text
     assert ">50.0 s<" in text
     assert ">median<" in text
+
+
+def test_memory_table_uses_the_maximum_call_and_sr(tmp_path: Path) -> None:
+    gib = 1024**3
+    profiles = tmp_path / "profiles"
+    paths = []
+    peaks = (
+        (40 * gib, 50 * gib, 10 * gib, 12 * gib),
+        (10 * gib, 70 * gib, None, None),
+    )
+    for index, (call_allocated, call_reserved, sr_allocated, sr_reserved) in enumerate(peaks):
+        payload = _profile("lite-fhd", dit=10.0 + index, vae=2.0)
+        payload["run"]["offload_strategy"] = "module"
+        payload["environment"]["gpu_total_mem"] = 80 * gib
+        payload["measurements"]["total_peak_allocated_mem"] = call_allocated
+        payload["measurements"]["total_peak_reserved_mem"] = call_reserved
+        if sr_allocated is not None:
+            payload["measurements"]["sr_peak_allocated_mem"] = sr_allocated
+            payload["measurements"]["sr_peak_reserved_mem"] = sr_reserved
+        path = profiles / f"lite-fhd_2026-10-13T00-00-0{index}-000000.json"
+        profiles.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        paths.append(path)
+    (tmp_path / "results.json").write_text(
+        json.dumps([{"name": "lite-fhd", "success": True, "profiles": [str(path) for path in paths]}]),
+        encoding="utf-8",
+    )
+
+    text = write_module_time_report(tmp_path).read_text(encoding="utf-8")
+    section = text.split("<h2>Peak memory, GiB</h2>", 1)[1]
+    assert "<th>dit</th>" not in section
+    assert "<th>call</th>" not in section
+    assert '<th colspan="2" class="group">generate</th>' in section
+    assert '<th colspan="2" class="group split">sr</th>' in section
+    assert section.count("<th>allocated</th>") == 1
+    assert section.count('<th class="split">allocated</th>') == 1
+    assert ">40.0<" in section
+    assert ">70.0<" in section
+    assert ">10.0<" in section
+    assert ">12.0<" in section
+    assert ">module<" in section
+    assert "this GPU (80 GiB)" in section
+    assert not re.search(r"[А-Яа-яЁё]", section)
 
 
 def test_report_is_skipped_without_profiles(tmp_path: Path) -> None:

@@ -74,7 +74,9 @@ def generate(  # noqa: PLR0913
     and ``profiles/``. ``--out`` writes the given file instead.
     ``--warmup`` runs the same generation once without saving, then the saved run.
     The profile JSON is the second run. When SR runs, that JSON also records
-    ``measurements.sr_time`` for the saved SR pass.
+    ``measurements.sr_time`` for the saved pass and ``sr_peak_allocated_mem`` /
+    ``sr_peak_reserved_mem`` for the whole SR stage, including weight load and
+    kernel warmup.
     """
     from kandinsky.pipeline.factory import get_pipeline
 
@@ -196,11 +198,6 @@ def _write_run_prompt(run: Path, video_path: Path, prompts: list[str] | None) ->
     return target
 
 
-def _synchronize(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize(torch.device(device))
-
-
 def _super_resolve_if_enabled(  # noqa: PLR0913
     config: str,
     device: str,
@@ -222,36 +219,36 @@ def _super_resolve_if_enabled(  # noqa: PLR0913
     ``_sr`` suffix, carrying the generated audio track.
     """
     torch.cuda.empty_cache()
-    sr_pipe = load_sr_pipeline(config, device, force=force, offload_strategy=offload_strategy)
-    if sr_pipe is None:
-        return
-    from kandinsky_sr.pipeline.components import scale_factor_for
-    from kandinsky_sr.pipeline.warmup import clip_base_resolution, compile_vae_decode, warmup
-    out_path = Path(out)
-    sr_path = out_path.with_name(f"{out_path.stem}_sr{out_path.suffix}")
-    frames_tchw = result.frames[0].permute(1, 0, 2, 3).contiguous().cpu()  # (3,T,H,W) -> (T,3,H,W)
-    # One-time compile work outside the SR pipeline, as kandy-sr does: flex/nabla
-    # attention kernels, then the KVAE decode for the base resolution this clip tiles into.
-    with sr_pipe.offload.use("dit"):
-        warmup(sr_pipe.dit, scale_factor_for(sr_pipe), device)
-    with sr_pipe.offload.use("vae"):
-        compile_vae_decode(sr_pipe, device, bases=[clip_base_resolution(sr_pipe, tuple(frames_tchw.shape[-2:]))])
-    sr_kwargs = {
-        "video": frames_tchw,
-        "audio": result.audio,
-        "fps": fps,
-        "audio_sample_rate": audio_fps,
-        "show_progress": show_progress,
-    }
-    if warmup:
-        logger.info("warmup SR")
-        print("Warmup SR")
-        sr_pipe(**sr_kwargs, save_path=None)
-    _synchronize(device)
-    started = time.perf_counter()
-    sr_result = sr_pipe(**sr_kwargs, save_path=str(sr_path))
-    _synchronize(device)
-    profile.note_sr(time.perf_counter() - started)
+    with profile.measure_sr(device) as sr_pass:
+        sr_pipe = load_sr_pipeline(config, device, force=force, offload_strategy=offload_strategy)
+        if sr_pipe is None:
+            return
+        from kandinsky_sr.pipeline.components import scale_factor_for
+        from kandinsky_sr.pipeline.warmup import clip_base_resolution, compile_vae_decode, warmup
+        out_path = Path(out)
+        sr_path = out_path.with_name(f"{out_path.stem}_sr{out_path.suffix}")
+        frames_tchw = result.frames[0].permute(1, 0, 2, 3).contiguous().cpu()  # (3,T,H,W) -> (T,3,H,W)
+        # One-time compile work outside the SR pipeline, as kandy-sr does: flex/nabla
+        # attention kernels, then the KVAE decode for the base resolution this clip tiles into.
+        with sr_pipe.offload.use("dit"):
+            warmup(sr_pipe.dit, scale_factor_for(sr_pipe), device)
+        with sr_pipe.offload.use("vae"):
+            compile_vae_decode(sr_pipe, device, bases=[clip_base_resolution(sr_pipe, tuple(frames_tchw.shape[-2:]))])
+        sr_kwargs = {
+            "video": frames_tchw,
+            "audio": result.audio,
+            "fps": fps,
+            "audio_sample_rate": audio_fps,
+            "show_progress": show_progress,
+        }
+        if warmup:
+            logger.info("warmup SR")
+            print("Warmup SR")
+            sr_pipe(**sr_kwargs, save_path=None)
+        started = time.perf_counter()
+        sr_result = sr_pipe(**sr_kwargs, save_path=str(sr_path))
+        sr_pass.elapsed = time.perf_counter() - started
+        sr_pass.save = True
     print(f"Saved SR x{sr_pipe.resolution_scale} {tuple(sr_result.frames.shape[-2:])} → {sr_result.path}")
 
 

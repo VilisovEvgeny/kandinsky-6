@@ -327,13 +327,6 @@ def _median_sample(samples: list[_Sample]) -> _Sample:
     return _Sample(elapsed, ordered[mid].profile)
 
 
-def _synchronize(device: str) -> None:
-    import torch
-
-    if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize(torch.device(device))
-
-
 def _super_resolve(pipe, result, out: Path) -> None:
     """Saved SR pass. The base pipeline stays loaded for the next resolution."""
     import torch
@@ -344,38 +337,39 @@ def _super_resolve(pipe, result, out: Path) -> None:
         return
     device = str(pipe.device)
     torch.cuda.empty_cache()
-    sr_pipe = load_sr_pipeline(pipe.config, device)
-    if sr_pipe is None:
-        return
+    sr_pipe = None
     try:
-        from kandinsky_sr.pipeline.components import scale_factor_for
-        from kandinsky_sr.pipeline.warmup import clip_base_resolution, compile_vae_decode
-        from kandinsky_sr.pipeline.warmup import warmup as warmup_sr
+        with pipe.profile.measure_sr(device) as sr_pass:
+            sr_pipe = load_sr_pipeline(pipe.config, device)
+            if sr_pipe is None:
+                return
+            from kandinsky_sr.pipeline.components import scale_factor_for
+            from kandinsky_sr.pipeline.warmup import clip_base_resolution, compile_vae_decode
+            from kandinsky_sr.pipeline.warmup import warmup as warmup_sr
 
-        sr_path = out.with_name(f"{out.stem}_sr{out.suffix}")
-        frames_tchw = result.frames[0].permute(1, 0, 2, 3).contiguous().cpu()
-        with sr_pipe.offload.use("dit"):
-            warmup_sr(sr_pipe.dit, scale_factor_for(sr_pipe), device)
-        with sr_pipe.offload.use("vae"):
-            compile_vae_decode(
-                sr_pipe,
-                device,
-                bases=[clip_base_resolution(sr_pipe, tuple(frames_tchw.shape[-2:]))],
-            )
-        sr_kwargs = {
-            "video": frames_tchw,
-            "audio": result.audio,
-            "fps": int(pipe.fps),
-            "audio_sample_rate": pipe.audio_fps,
-            "show_progress": True,
-        }
-        _synchronize(device)
-        started = time.perf_counter()
-        sr_result = sr_pipe(**sr_kwargs, save_path=str(sr_path))
-        _synchronize(device)
-        pipe.profile.note_sr(time.perf_counter() - started)
-        shape = tuple(sr_result.frames.shape[-2:])
-        print(f"Saved SR x{sr_pipe.resolution_scale} {shape} → {sr_result.path}", flush=True)
+            sr_path = out.with_name(f"{out.stem}_sr{out.suffix}")
+            frames_tchw = result.frames[0].permute(1, 0, 2, 3).contiguous().cpu()
+            with sr_pipe.offload.use("dit"):
+                warmup_sr(sr_pipe.dit, scale_factor_for(sr_pipe), device)
+            with sr_pipe.offload.use("vae"):
+                compile_vae_decode(
+                    sr_pipe,
+                    device,
+                    bases=[clip_base_resolution(sr_pipe, tuple(frames_tchw.shape[-2:]))],
+                )
+            sr_kwargs = {
+                "video": frames_tchw,
+                "audio": result.audio,
+                "fps": int(pipe.fps),
+                "audio_sample_rate": pipe.audio_fps,
+                "show_progress": True,
+            }
+            started = time.perf_counter()
+            sr_result = sr_pipe(**sr_kwargs, save_path=str(sr_path))
+            sr_pass.elapsed = time.perf_counter() - started
+            sr_pass.save = True
+            shape = tuple(sr_result.frames.shape[-2:])
+            print(f"Saved SR x{sr_pipe.resolution_scale} {shape} → {sr_result.path}", flush=True)
     finally:
         del sr_pipe
         torch.cuda.empty_cache()

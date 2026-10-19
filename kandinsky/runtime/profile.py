@@ -2,7 +2,9 @@
 
 The policy is off unless ``profile.mode`` is set. ``time_mem_module`` times each
 pipeline component and records its CUDA memory high-water mark, plus the same
-totals for the whole ``pipeline.__call__``.
+totals for the whole ``pipeline.__call__``. A super-resolution stage is
+recorded afterwards: its time is the saved pass, and its peaks cover weight
+load and kernel warmup as well.
 
 Bench / chrome profiling is separate: it installs temporary
 ``record_function`` wrappers via :func:`instrument_record_functions`.
@@ -153,6 +155,8 @@ class ProfileReport:
     total_peak_allocated_mem: int
     total_peak_reserved_mem: int
     sr_time: float | None = None
+    sr_peak_allocated_mem: int = 0
+    sr_peak_reserved_mem: int = 0
 
 
 class ProfileHandle(Protocol):
@@ -168,7 +172,15 @@ class ProfileHandle(Protocol):
 
     def note_prompt(self, prompt: str | list[str]) -> None: ...
 
-    def note_sr(self, elapsed: float) -> None: ...
+    def note_sr(
+        self,
+        elapsed: float,
+        *,
+        peak_allocated_mem: int = 0,
+        peak_reserved_mem: int = 0,
+    ) -> None: ...
+
+    def measure_sr(self, device: str | torch.device) -> Iterator[SrTiming]: ...
 
     @property
     def report(self) -> ProfileReport: ...
@@ -193,6 +205,19 @@ def attach_profile(pipe: object, mode: ProfileMode) -> ProfileHandle:
     return handle
 
 
+class SrTiming:
+    """Saved-pass duration for one :meth:`ProfileHandle.measure_sr` block.
+
+    ``elapsed`` is only the saved pass. Peaks cover the whole block. Set
+    ``save`` after that pass finishes; a block that returns without it is not
+    written.
+    """
+
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.save = False
+
+
 class NoOpProfile:
     mode: ProfileMode = "none"
 
@@ -212,8 +237,19 @@ class NoOpProfile:
     def note_prompt(self, prompt: str | list[str]) -> None:
         del prompt
 
-    def note_sr(self, elapsed: float) -> None:
-        del elapsed
+    def note_sr(
+        self,
+        elapsed: float,
+        *,
+        peak_allocated_mem: int = 0,
+        peak_reserved_mem: int = 0,
+    ) -> None:
+        del elapsed, peak_allocated_mem, peak_reserved_mem
+
+    @contextmanager
+    def measure_sr(self, device: str | torch.device) -> Iterator[SrTiming]:
+        del device
+        yield SrTiming()
 
     @property
     def report(self) -> ProfileReport:
@@ -310,9 +346,23 @@ class TimeMemModuleProfile:
         """Record the caption encoded for this call, after prompt expansion."""
         self._raw_call["prompt"] = prompt
 
-    def note_sr(self, elapsed: float) -> None:
-        """Record the saved super-resolution pass on the JSON of the last profiled call."""
-        self._last = replace(self._last, sr_time=elapsed)
+    def note_sr(
+        self,
+        elapsed: float,
+        *,
+        peak_allocated_mem: int = 0,
+        peak_reserved_mem: int = 0,
+    ) -> None:
+        """Record the super-resolution stage on the JSON of the last profiled call.
+
+        ``elapsed`` is the saved pass. Peaks are bytes and cover the whole stage.
+        """
+        self._last = replace(
+            self._last,
+            sr_time=elapsed,
+            sr_peak_allocated_mem=peak_allocated_mem,
+            sr_peak_reserved_mem=peak_reserved_mem,
+        )
         path = self._written
         if path is None or not path.is_file():
             return
@@ -321,10 +371,52 @@ class TimeMemModuleProfile:
         if not isinstance(measurements, dict):
             return
         measurements["sr_time"] = elapsed
+        measurements["sr_peak_allocated_mem"] = peak_allocated_mem
+        measurements["sr_peak_reserved_mem"] = peak_reserved_mem
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
-        logger.info("profile sr_time=%.4fs path=%s", elapsed, path)
+        logger.info(
+            "profile sr_time=%.4fs sr_peak_allocated_mem=%d sr_peak_reserved_mem=%d path=%s",
+            elapsed,
+            peak_allocated_mem,
+            peak_reserved_mem,
+            path,
+        )
+
+    @contextmanager
+    def measure_sr(self, device: str | torch.device) -> Iterator[SrTiming]:
+        """Record one SR stage on the last profile.
+
+        CUDA peaks reset on entry and are read on a successful exit, so they
+        cover weight load and kernel warmup inside the block. ``timing.elapsed``
+        is the saved pass only. Leave ``timing.save`` false, or raise, and the
+        profile stays unchanged.
+        """
+        cuda_device = torch.device(device)
+        use_cuda = cuda_device.type == "cuda" and torch.cuda.is_available()
+        if use_cuda:
+            torch.cuda.synchronize(cuda_device)
+            torch.cuda.reset_peak_memory_stats(cuda_device)
+        timing = SrTiming()
+        try:
+            yield timing
+        except BaseException:
+            if use_cuda:
+                torch.cuda.synchronize(cuda_device)
+            raise
+        if not timing.save:
+            return
+        allocated = reserved = 0
+        if use_cuda:
+            torch.cuda.synchronize(cuda_device)
+            allocated = int(torch.cuda.max_memory_allocated(cuda_device))
+            reserved = int(torch.cuda.max_memory_reserved(cuda_device))
+        self.note_sr(
+            timing.elapsed,
+            peak_allocated_mem=allocated,
+            peak_reserved_mem=reserved,
+        )
 
     def _patch(self, obj: Any, attr: str, new: Callable[..., Any]) -> None:
         prev = obj.__dict__.get(attr, None)
