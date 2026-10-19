@@ -14,4 +14,4 @@ Run every recipe from the repository root. You need [uv](https://docs.astral.sh/
 | `just setup-vllm`, `just generate-vllm`, `just serve-vllm` | [vLLM-Omni](quick_start_vllm.md) |
 | `just setup-sglang`, `just generate-sglang`, `just serve-sglang` | [SGLang](quick_start_sglang.md) |
 | `just setup-fastvideo`, `just generate-fastvideo` | [FastVideo](quick_start_fastvideo.md) |
-| `just bench` | Twelve native t2v timings on one GPU. JSON files go to `profiles/` in the run folder. |
+| `just bench` | Eight native t2v timings on one GPU: SD and Full HD. JSON files go to `profiles/` in the run folder. |

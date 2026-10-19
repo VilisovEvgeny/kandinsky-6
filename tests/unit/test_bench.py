@@ -1,4 +1,4 @@
-"""Twelve-cell timing plan: one load per checkpoint, three resolutions each."""
+"""Eight-cell timing plan: one load per checkpoint, SD and Full HD."""
 
 from __future__ import annotations
 
@@ -7,7 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from kandinsky.bench import CHECKPOINTS, RESOLUTIONS, bind_run_profiles, write_plan
+from kandinsky.tools.bench import (
+    CHECKPOINTS,
+    RESOLUTIONS,
+    _Sample,
+    _is_oom,
+    _keep_completed,
+    _median_sample,
+    _next_offload,
+    bind_run_profiles,
+    initial_offload,
+    write_plan,
+)
 from kandinsky.pipeline.config import load_config
 from kandinsky.pipeline.reconfigure import _dit_needs_reload
 from kandinsky.runtime.profile import _profile_output_dir
@@ -17,26 +28,22 @@ _CHECKPOINTS = _ROOT / "kandinsky" / "configs" / "checkpoints"
 _SR = "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers"
 
 
-def test_plan_is_twelve_cells_grouped_by_checkpoint(tmp_path: Path) -> None:
+def test_plan_is_eight_cells_grouped_by_checkpoint(tmp_path: Path) -> None:
     groups = write_plan(tmp_path)
     assert [group.checkpoint for group in groups] == list(CHECKPOINTS)
-    assert [resolution.name for resolution in RESOLUTIONS] == ["sd", "hd", "fhd"]
+    assert [resolution.name for resolution in RESOLUTIONS] == ["sd", "fhd"]
     names = [job.name for group in groups for job in group.jobs]
     assert names == [
         "lite-sd",
-        "lite-hd",
         "lite-fhd",
         "lite-distill-sd",
-        "lite-distill-hd",
         "lite-distill-fhd",
         "pro-sd",
-        "pro-hd",
         "pro-fhd",
         "pro-distill-sd",
-        "pro-distill-hd",
         "pro-distill-fhd",
     ]
-    assert all(len(group.jobs) == 3 for group in groups)
+    assert all(len(group.jobs) == 2 for group in groups)
 
 
 @pytest.mark.parametrize("checkpoint", ["lite", "pro", "lite-distill", "pro-distill"])
@@ -53,7 +60,7 @@ def test_cell_keeps_one_checkpoint_across_resolutions(checkpoint: str, tmp_path:
         assert cfg.generation.width == resolution.width
         assert cfg.generation.sample_frames == 121
         assert cfg.compile.strategy == "torch"
-        assert cfg.offload.strategy == "module"
+        assert cfg.offload.strategy == "none"
         assert cfg.attention.engine == "flash_attention_3"
         assert cfg.beautifier.name == "qwen25"
         assert cfg.profile.mode == "time_mem_module"
@@ -81,8 +88,6 @@ def test_cell_keeps_one_checkpoint_across_resolutions(checkpoint: str, tmp_path:
             assert cfg.sr.resolution_scale == resolution.scale
             assert cfg.sr.num_steps == 2
 
-    assert _dit_needs_reload(loaded["sd"], loaded["hd"]) is False
-    assert _dit_needs_reload(loaded["hd"], loaded["fhd"]) is False
     assert _dit_needs_reload(loaded["sd"], loaded["fhd"]) is False
 
 
@@ -100,6 +105,47 @@ def test_profiles_go_to_the_run_folder(tmp_path: Path, monkeypatch: pytest.Monke
     assert directory.is_dir()
     assert os.environ["KANDINSKY_PROFILE_DIR"] == str(directory)
     assert _profile_output_dir() == directory
+
+
+def test_initial_offload_follows_module_bytes() -> None:
+    assert initial_offload({"dit": 40, "vae": 10}, 100) == "none"
+    assert initial_offload({"dit": 60, "vae": 50}, 100) == "module"
+    assert initial_offload({"dit": 200, "vae": 10}, 100) == "block"
+    assert initial_offload({}, 100) == "none"
+    assert initial_offload({"dit": 10}, 0) == "none"
+
+
+def test_oom_keeps_the_largest_completed_set(tmp_path: Path) -> None:
+    module = [_Sample(1.0, tmp_path / "a.json"), _Sample(2.0, tmp_path / "b.json")]
+    block = [_Sample(3.0, tmp_path / "c.json")]
+    kept = _keep_completed(None, module, "module")
+    assert kept is not None
+    assert [sample.profile.name for sample in kept[0]] == ["a.json", "b.json"]
+    assert kept[1] == "module"
+    kept = _keep_completed(kept, [], "module")
+    assert len(kept[0]) == 2
+    kept = _keep_completed(kept, block, "block")
+    assert len(kept[0]) == 2
+    assert kept[1] == "module"
+    replaced = _keep_completed(kept, module + block, "block")
+    assert replaced is not None
+    assert len(replaced[0]) == 3
+    assert replaced[1] == "block"
+
+
+def test_oom_steps_to_the_next_offload() -> None:
+    assert _is_oom(RuntimeError("CUDA out of memory. Tried to allocate 1 GiB"))
+    assert not _is_oom(RuntimeError("missing output"))
+    assert _next_offload("none") == "module"
+    assert _next_offload("module") == "block"
+    assert _next_offload("block") is None
+
+
+def test_median_sample_is_the_middle_run(tmp_path: Path) -> None:
+    samples = [_Sample(float(value), tmp_path / f"{value}.json") for value in (9, 1, 4, 3, 8)]
+    chosen = _median_sample(samples)
+    assert chosen.elapsed == 4
+    assert chosen.profile.name == "4.json"
 
 
 def test_justfile_runs_the_bench() -> None:

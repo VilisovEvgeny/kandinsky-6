@@ -6,8 +6,8 @@ import json
 import re
 from pathlib import Path
 
-from kandinsky.bench import RunResult, run
-from kandinsky.bench_report import write_module_time_report
+from kandinsky.tools.bench import RunResult, run
+from kandinsky.tools.bench_report import write_module_time_report
 
 _DIT = "#2563EB"
 
@@ -87,9 +87,67 @@ def test_sr_is_a_module_in_the_same_total(tmp_path: Path) -> None:
 
     text = write_module_time_report(tmp_path).read_text(encoding="utf-8")
     assert 'fill="#0891B2"' in text
+    assert "prefers-color-scheme: dark" in text
+    assert "body.vscode-dark" in text
+    assert "--heat-dark:" in text
     assert ">39.6<" in text
     assert "<th>sr</th>" in text
     assert "SR is outside" not in text
+
+
+def test_report_uses_the_recorded_profile_not_the_latest(tmp_path: Path) -> None:
+    profiles = tmp_path / "profiles"
+    _write_profile(profiles, "lite-sd", _profile("lite-sd", dit=10.0, vae=5.0))
+    early = profiles / "lite-sd_2026-10-13T00-00-00-000000.json"
+    late = profiles / "lite-sd_2026-10-13T00-00-01-000000.json"
+    late.write_text(json.dumps(_profile("lite-sd", dit=80.0, vae=5.0)), encoding="utf-8")
+    failed = profiles / "lite-hd_2026-10-13T00-00-02-000000.json"
+    failed.write_text(json.dumps(_profile("lite-hd", dit=80.0, vae=5.0)), encoding="utf-8")
+    (tmp_path / "results.json").write_text(
+        json.dumps(
+            [
+                {"name": "lite-sd", "success": True, "profile": str(early)},
+                {"name": "lite-hd", "success": False, "profile": str(failed)},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    text = write_module_time_report(tmp_path).read_text(encoding="utf-8")
+    assert "lite-sd" in text
+    assert "lite-hd" not in text
+    assert "62.5" in text
+
+
+def test_module_shares_are_medians_across_the_recorded_repetitions(tmp_path: Path) -> None:
+    profiles = tmp_path / "profiles"
+    recorded = []
+    for index, dit in enumerate((10.0, 40.0, 20.0, 100.0)):
+        path = profiles / f"lite-sd_2026-10-13T00-00-0{index}-000000.json"
+        profiles.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_profile("lite-sd", dit=dit, vae=2.0)), encoding="utf-8")
+        recorded.append(path)
+    ignored = profiles / "lite-sd_2026-10-13T00-00-09-000000.json"
+    ignored.write_text(json.dumps(_profile("lite-sd", dit=1.0, vae=2.0)), encoding="utf-8")
+    (tmp_path / "results.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": "lite-sd",
+                    "success": True,
+                    "seconds": 50.0,
+                    "profile": str(recorded[2]),
+                    "profiles": [str(path) for path in recorded],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    text = write_module_time_report(tmp_path).read_text(encoding="utf-8")
+    assert "90.9" in text
+    assert ">50.0 s<" in text
+    assert ">median<" in text
 
 
 def test_report_is_skipped_without_profiles(tmp_path: Path) -> None:
@@ -98,7 +156,7 @@ def test_report_is_skipped_without_profiles(tmp_path: Path) -> None:
 
 def test_bench_writes_the_report(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("KANDINSKY_HOME", str(tmp_path))
-    monkeypatch.setattr("kandinsky.bench._one_gpu", lambda requested, threshold: 0)
+    monkeypatch.setattr("kandinsky.tools.bench._one_gpu", lambda requested, threshold: 0)
 
     def execute(groups, prompt, seed, run_dir, gpu_id):
         _write_profile(
@@ -116,7 +174,7 @@ def test_bench_writes_the_report(tmp_path: Path, monkeypatch) -> None:
             )
         ]
 
-    monkeypatch.setattr("kandinsky.bench._execute", execute)
+    monkeypatch.setattr("kandinsky.tools.bench._execute", execute)
     assert run(gpu=0) == 0
     reports = list((tmp_path / "outputs").glob("bench_*/module-time-report.html"))
     assert len(reports) == 1

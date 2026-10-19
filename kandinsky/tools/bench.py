@@ -1,13 +1,22 @@
-"""Twelve t2v timings on one GPU.
+"""Eight t2v timings on one GPU.
 
-Lite and Pro, distilled and not, at SD, HD, and Full HD. Each checkpoint is
-loaded once and reused for its three resolutions. Compile is torch, every cell
-warms up, and non-distilled checkpoints use the MagCache block from their
+Lite and Pro, distilled and not, at SD and Full HD. Each checkpoint is
+loaded once and reused for both resolutions. Compile is torch, and each
+cell is three generations. The reported time is their median, and the module
+chart uses the median of each module across those three profiles. There is no
+warmup pass. Non-distilled checkpoints use the MagCache block from their
 checkpoint file. Profile mode is ``time_mem_module``. JSON files go to
 ``profiles/`` inside the run folder. The same folder receives
 ``module-time-report.html`` after the cells finish.
 
-HD and Full HD match the performance report: the base clip is super-resolved
+Offload starts at ``none`` when the resident modules fit in VRAM, at ``module``
+when their sum does not, and at ``block`` when any one module is larger than
+the card. A CUDA out-of-memory error drops that attempt and tries the next
+strategy. Completed passes of one strategy stay in the result: a later
+out-of-memory error does not clear them. Failed attempts are not part of the
+median.
+
+Full HD matches the performance report: the base clip is super-resolved
 with the distilled 2-step VSR model. t2v here is text to video with audio and
 no reference image. Distilled checkpoints use PiFlow, which requires audio.
 """
@@ -27,9 +36,10 @@ from pathlib import Path
 
 import yaml
 
-from kandinsky.bench_report import write_module_time_report
+from kandinsky.tools.bench_report import write_module_time_report
 from kandinsky.pipeline.config import load_config
 from kandinsky.runtime.home import kandinsky_home
+from kandinsky.runtime.offload import OffloadStrategy
 
 _SR = "kandinskylab/Kandinsky-6.0-VSR-distilled2steps-5s-Diffusers"
 _SR_STEPS = 2
@@ -39,7 +49,10 @@ DEFAULT_PROMPT = (
     "It tilts its head back and exhales a stream of flame."
 )
 DEFAULT_SEED = 0
+REPEATS = 3
 _FREE_GPU_THRESHOLD_MIB = 1000
+_OFFLOAD_LADDER: tuple[OffloadStrategy, ...] = ("none", "module", "block")
+_RESIDENT_MODULES = ("text_embedder", "dit", "vae", "audio_vae", "vocoder")
 CHECKPOINTS = ("lite", "lite-distill", "pro", "pro-distill")
 
 
@@ -53,7 +66,6 @@ class Resolution:
 
 RESOLUTIONS = (
     Resolution("sd", 480, 864, None),
-    Resolution("hd", 432, 768, 2),
     Resolution("fhd", 480, 864, 2.25),
 )
 
@@ -80,6 +92,8 @@ class RunResult:
     elapsed: float | None
     log_path: Path
     profile_path: Path | None = None
+    offload: str = ""
+    profiles: tuple[Path, ...] = ()
     error: str = ""
 
 
@@ -91,13 +105,89 @@ def bind_run_profiles(run: Path) -> Path:
     return directory
 
 
+def initial_offload(module_bytes: dict[str, int], vram_bytes: int) -> OffloadStrategy:
+    """First offload strategy whose weights can reside on the card.
+
+    Unknown sizes start at ``none``. A module larger than the card starts at
+    ``block``. A sum larger than the card starts at ``module``.
+    """
+    if vram_bytes <= 0 or not module_bytes:
+        return "none"
+    if max(module_bytes.values()) > vram_bytes:
+        return "block"
+    if sum(module_bytes.values()) > vram_bytes:
+        return "module"
+    return "none"
+
+
+def resident_module_bytes(pipe) -> dict[str, int]:
+    """Parameter and buffer bytes of each offload module, counting each storage once."""
+    from torch import nn
+
+    sizes: dict[str, int] = {}
+    for name in _RESIDENT_MODULES:
+        module = getattr(pipe, name, None)
+        if module is None:
+            continue
+        sizes[name] = _unique_nbytes(module, nn.Module)
+    return sizes
+
+
+def _unique_nbytes(module, module_type: type) -> int:
+    seen: set[int] = set()
+    total = 0
+    for tensor in _resident_tensors(module, module_type):
+        storage = tensor.untyped_storage()
+        key = storage.data_ptr()
+        if key == 0 or key in seen:
+            continue
+        seen.add(key)
+        total += storage.nbytes()
+    return total
+
+
+def _resident_tensors(module, module_type: type):
+    if isinstance(module, module_type):
+        yield from module.parameters()
+        yield from module.buffers()
+        return
+    for value in vars(module).values():
+        if isinstance(value, module_type):
+            yield from value.parameters()
+            yield from value.buffers()
+
+
+def _keep_completed(
+    kept: tuple[list[_Sample], OffloadStrategy] | None,
+    samples: list[_Sample],
+    strategy: OffloadStrategy,
+) -> tuple[list[_Sample], OffloadStrategy] | None:
+    """Remember the largest finished set. A later OOM must not drop it."""
+    if not samples:
+        return kept
+    if kept is None or len(samples) > len(kept[0]):
+        return (list(samples), strategy)
+    return kept
+
+
+def _next_offload(strategy: OffloadStrategy) -> OffloadStrategy | None:
+    index = _OFFLOAD_LADDER.index(strategy)
+    if index + 1 == len(_OFFLOAD_LADDER):
+        return None
+    return _OFFLOAD_LADDER[index + 1]
+
+
+def _is_oom(exc: BaseException) -> bool:
+    return type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
+
+
 def cell_document(checkpoint: str, resolution: Resolution) -> dict:
     """Device preset for one cell. The checkpoint file supplies steps and PiFlow."""
     document = {
         "checkpoint": checkpoint,
         "generation": {"height": resolution.height, "width": resolution.width},
         "cache": {"mode": "none"},
-        "offload": {"strategy": "module"},
+        "offload": {"strategy": "none"},
         "compile": {"strategy": "torch"},
         "attention": {"engine": "flash_attention_3"},
         "text_embedder": {"quantized_qwen": False},
@@ -221,17 +311,20 @@ def _generate(pipe, prompt: str, seed: int, save_path: Path | None):
     )
 
 
-def _warmup_then_generate(pipe, prompt: str, seed: int, save_path: Path):
-    from kandinsky.runtime.profile import NoOpProfile
+@dataclass
+class _Sample:
+    elapsed: float
+    profile: Path
 
-    timed = pipe.profile
-    pipe.profile = NoOpProfile()
-    try:
-        print("Warmup", flush=True)
-        _generate(pipe, prompt, seed, None)
-    finally:
-        pipe.profile = timed
-    return _generate(pipe, prompt, seed, save_path)
+
+def _median_sample(samples: list[_Sample]) -> _Sample:
+    """Middle sample of an odd count. An even count averages the two central times."""
+    ordered = sorted(samples, key=lambda item: item.elapsed)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    elapsed = (ordered[mid - 1].elapsed + ordered[mid].elapsed) / 2
+    return _Sample(elapsed, ordered[mid].profile)
 
 
 def _synchronize(device: str) -> None:
@@ -276,8 +369,6 @@ def _super_resolve(pipe, result, out: Path) -> None:
             "audio_sample_rate": pipe.audio_fps,
             "show_progress": True,
         }
-        print("Warmup SR", flush=True)
-        sr_pipe(**sr_kwargs, save_path=None)
         _synchronize(device)
         started = time.perf_counter()
         sr_result = sr_pipe(**sr_kwargs, save_path=str(sr_path))
@@ -291,7 +382,7 @@ def _super_resolve(pipe, result, out: Path) -> None:
 
 
 def _second_pass_time(path: Path | None) -> float | None:
-    """Profiled generation plus SR. Warmup is not in the JSON."""
+    """Profiled generation plus SR."""
     if path is None or not path.is_file():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -315,8 +406,26 @@ def _release(pipe) -> None:
         torch.cuda.empty_cache()
 
 
-def _run_cell(pipe, job: Job, prompt: str, seed: int, out_path: Path) -> tuple[float, Path]:
-    result = _warmup_then_generate(pipe, prompt, seed, out_path)
+def _vram_bytes(device) -> int:
+    import torch
+
+    if not torch.cuda.is_available():
+        return 0
+    cuda = torch.device(device)
+    index = cuda.index if cuda.index is not None else torch.cuda.current_device()
+    return int(torch.cuda.get_device_properties(index).total_memory)
+
+
+def _empty_cache() -> None:
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _one_pass(pipe, job: Job, prompt: str, seed: int, out_path: Path) -> _Sample:
+    result = _generate(pipe, prompt, seed, out_path)
     kind = "frames + audio" if result.audio is not None else "frames"
     print(f"Saved {result.frames.shape[2]} {kind} → {result.path}", flush=True)
     _super_resolve(pipe, result, out_path)
@@ -328,7 +437,58 @@ def _run_cell(pipe, job: Job, prompt: str, seed: int, out_path: Path) -> tuple[f
         raise RuntimeError(f"missing output {out_path}")
     if job.sr and not out_path.with_name(f"{out_path.stem}_sr{out_path.suffix}").is_file():
         raise RuntimeError(f"missing SR output for {job.name}")
-    return elapsed, profile_path
+    return _Sample(elapsed, profile_path)
+
+
+def _use_offload(pipe, job: Job, strategy: OffloadStrategy):
+    if getattr(pipe, "offload_strategy", None) == strategy:
+        return pipe
+    return pipe.reconfigure(job.config_path, offload_strategy=strategy)
+
+
+def _cell_result(
+    samples: list[_Sample], strategy: OffloadStrategy
+) -> tuple[float, Path, OffloadStrategy, tuple[Path, ...]]:
+    chosen = _median_sample(samples)
+    return chosen.elapsed, chosen.profile, strategy, tuple(sample.profile for sample in samples)
+
+
+def _run_cell(
+    pipe, job: Job, prompt: str, seed: int, out_path: Path
+) -> tuple[float, Path, OffloadStrategy, tuple[Path, ...]]:
+    """Up to three generations at one offload strategy. OOM steps up the ladder.
+
+    A finished pass is kept. Switching strategy starts a new set, and the
+    result is the largest set that completed. An empty ladder still raises.
+    """
+    strategy = initial_offload(resident_module_bytes(pipe), _vram_bytes(pipe.device))
+    samples: list[_Sample] = []
+    kept: tuple[list[_Sample], OffloadStrategy] | None = None
+    while len(samples) < REPEATS:
+        try:
+            pipe = _use_offload(pipe, job, strategy)
+            sample = _one_pass(pipe, job, prompt, seed, out_path)
+        except Exception as exc:
+            _empty_cache()
+            if not _is_oom(exc):
+                raise
+            nxt = _next_offload(strategy)
+            print(f"OOM with offload={strategy}" + ("" if nxt is None else f"; trying {nxt}"), flush=True)
+            kept = _keep_completed(kept, samples, strategy)
+            samples.clear()
+            if nxt is None:
+                if kept is None:
+                    raise
+                print(
+                    f"keeping {len(kept[0])} completed pass(es) at offload={kept[1]}",
+                    flush=True,
+                )
+                return _cell_result(kept[0], kept[1])
+            strategy = nxt
+            continue
+        samples.append(sample)
+        print(f"  rep {len(samples)}/{REPEATS} {sample.elapsed:.1f}s offload={strategy}", flush=True)
+    return _cell_result(samples, strategy)
 
 
 def _execute(groups: list[Group], prompt: str, seed: int, run: Path, gpu_id: int) -> list[RunResult]:
@@ -349,14 +509,15 @@ def _execute(groups: list[Group], prompt: str, seed: int, run: Path, gpu_id: int
             log_path = run / "logs" / f"{job.name}.log"
             out_path = run / "generations" / f"{job.name}.mp4"
             try:
+                # Load on CPU. The cell moves weights to the card only after the size check.
                 if pipe is None:
-                    pipe = get_pipeline(str(job.config_path), device="cuda:0")
+                    pipe = get_pipeline(str(job.config_path), device="cuda:0", offload_strategy="module")
                 else:
-                    pipe.reconfigure(job.config_path)
-                elapsed, profile_path = _run_cell(pipe, job, prompt, seed, out_path)
-                result = RunResult(job.name, True, elapsed, log_path, profile_path)
+                    pipe.reconfigure(job.config_path, offload_strategy="module")
+                elapsed, profile_path, strategy, profiles = _run_cell(pipe, job, prompt, seed, out_path)
+                result = RunResult(job.name, True, elapsed, log_path, profile_path, strategy, profiles)
                 log_path.write_text(
-                    f"OK gen+sr {elapsed:.3f}s\nprofile {profile_path}\n",
+                    f"OK median {elapsed:.3f}s offload={strategy} repeats={len(profiles)}\nprofile {profile_path}\n",
                     encoding="utf-8",
                 )
             except Exception as exc:
@@ -377,29 +538,33 @@ def _execute(groups: list[Group], prompt: str, seed: int, run: Path, gpu_id: int
 
 
 def _print_summary(results: list[RunResult], wall: float, run: Path, profiles: Path) -> bool:
-    print(f"\n{'Job':<20} {'Result':>6} {'Gen+SR':>8}")
-    print("-" * 38)
+    print(f"\n{'Job':<20} {'Result':>6} {'Offload':>8} {'Median':>8}")
+    print("-" * 48)
     all_ok = True
     recorded = []
     for result in results:
         status = "OK" if result.success else "FAIL"
         shown = "n/a" if result.elapsed is None else f"{result.elapsed:7.1f}s"
         hint = "" if result.success else f"  <- {result.log_path}"
-        print(f"{result.name:<20} {status:>6} {shown:>8}{hint}")
+        offload = result.offload or "-"
+        print(f"{result.name:<20} {status:>6} {offload:>8} {shown:>8}{hint}")
         all_ok = all_ok and result.success
         recorded.append(
             {
                 "name": result.name,
                 "success": result.success,
                 "seconds": result.elapsed,
+                "offload": result.offload,
+                "repeats": len(result.profiles) if result.success else 0,
                 "profile": None if result.profile_path is None else str(result.profile_path),
+                "profiles": [str(path) for path in result.profiles],
                 "log": str(result.log_path),
                 "error": result.error,
             }
         )
-    print("-" * 38)
+    print("-" * 48)
     verdict = "All passed." if all_ok else "Some jobs FAILED."
-    print("Gen+SR is the profiled second pass: generation + SR. Warmup is excluded.")
+    print("Median uses the completed generations of one offload strategy. Failed attempts are excluded.")
     print(f"Wall time: {wall:.0f}s   {verdict}")
     print(f"Run: {run}")
     print(f"Profiles: {profiles}")
@@ -414,7 +579,7 @@ def run(
     seed: int = DEFAULT_SEED,
     mem_threshold: int = _FREE_GPU_THRESHOLD_MIB,
 ) -> int:
-    """Run the twelve cells. Returns a process status code."""
+    """Run the eight cells. Returns a process status code."""
     text = DEFAULT_PROMPT if prompt is None else prompt
     home = kandinsky_home()
     home.mkdir(parents=True, exist_ok=True)

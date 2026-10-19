@@ -25,12 +25,13 @@ generate-sr *ARGS:
 download NAME *ARGS:
     @uv run kandy download {{NAME}} {{ARGS}}
 
-# Each checkpoint stays loaded for its three resolutions. Compile and warmup
-# are on. Non-distilled checkpoints use MagCache from the checkpoint file.
-# HD and Full HD include super-resolution. Profile JSON files go to
+# Each checkpoint stays loaded for SD and Full HD. Compile is on.
+# Three generations, median time, offload chosen from VRAM.
+# Non-distilled checkpoints use MagCache from the checkpoint file.
+# Full HD includes super-resolution. Profile JSON files go to
 # profiles/ inside the run folder. module-time-report.html is written there too.
 # just bench
-# Twelve t2v timings on one GPU: Lite/Pro, distilled and not, SD/HD/Full HD. just bench [--gpu 0]
+# Eight t2v timings on one GPU: Lite/Pro, distilled and not, SD/Full HD. just bench [--gpu 0]
 bench *ARGS:
     @uv run kandy bench {{ARGS}}
 

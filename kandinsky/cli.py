@@ -263,17 +263,19 @@ def bench(
     seed: int = 0,
     mem_threshold: int = 1000,
 ) -> None:
-    """Time twelve t2v generations on one GPU.
+    """Time eight t2v generations on one GPU.
 
-    Lite and Pro, distilled and not, at SD, HD, and Full HD. Each checkpoint
-    is loaded once and reused for its three resolutions. Compile is torch,
-    every cell warms up, and non-distilled checkpoints use MagCache from the
-    checkpoint file. Profile mode is ``time_mem_module``. JSON files go to
+    Lite and Pro, distilled and not, at SD and Full HD. Each checkpoint
+    is loaded once and reused for both resolutions. Compile is torch.
+    Each cell runs three times and reports the median. Offload is chosen from
+    module sizes and raised when a run runs out of memory. Non-distilled
+    checkpoints use MagCache from the checkpoint file. Profile mode is
+    ``time_mem_module``. JSON files go to
     ``profiles/`` inside ``$KANDINSKY_HOME/outputs/bench_<date-time>/``.
     That folder also receives ``module-time-report.html``.
     ``--gpu`` selects one card. When it is omitted, the first free GPU is used.
     """
-    from kandinsky.bench import run
+    from kandinsky.tools.bench import run
 
     raise SystemExit(run(gpu=gpu, prompt=prompt, seed=seed, mem_threshold=mem_threshold))
 
