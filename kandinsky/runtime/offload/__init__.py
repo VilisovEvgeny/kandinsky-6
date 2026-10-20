@@ -27,6 +27,7 @@ __all__ = (
     "OffloadStrategy",
     "_module_to",
     "build_offload",
+    "reject_release_without_offload",
 )
 
 
@@ -47,7 +48,9 @@ class OffloadHandle(Protocol):
 
     strategy: OffloadStrategy
 
-    def register(self, name: str, module: Any) -> None: ...
+    def register(self, name: str, module: Any, *, release: bool = False) -> None: ...
+
+    def releases(self, name: str) -> bool: ...
 
     def release(self, *names: str) -> None: ...
 
@@ -64,8 +67,12 @@ class NoOpOffload:
 
     strategy: OffloadStrategy = "none"
 
-    def register(self, name: str, module: Any) -> None:
-        return None
+    def register(self, name: str, module: Any, *, release: bool = False) -> None:
+        del name, module, release
+
+    def releases(self, name: str) -> bool:
+        del name
+        return False
 
     def release(self, *names: str) -> None:
         return None
@@ -77,6 +84,14 @@ class NoOpOffload:
         prefetch: str | Sequence[str] | None = None,
     ) -> Iterator[None]:
         yield
+
+
+def reject_release_without_offload(strategy: OffloadStrategy, release_after_encode: bool) -> None:
+    """Drop-on-exit text weights need a module or block offload stage."""
+    if release_after_encode and strategy == "none":
+        raise ValueError(
+            "text_embedder.release_after_encode requires offload.strategy 'module' or 'block'"
+        )
 
 
 def build_offload(

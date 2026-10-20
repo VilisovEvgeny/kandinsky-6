@@ -21,7 +21,7 @@ from kandinsky.runtime.aoti import bind_aoti_to_visual_blocks
 from kandinsky.runtime.cache import CacheDiT
 from kandinsky.runtime.compile import DiTCompiler, restore_execution
 from kandinsky.runtime.kernels import bind_attention, rebind_attention
-from kandinsky.runtime.offload import OffloadStrategy, _module_to, build_offload
+from kandinsky.runtime.offload import OffloadStrategy, _module_to, build_offload, reject_release_without_offload
 from kandinsky.runtime.profile import attach_profile, diff_launch_overrides
 from kandinsky.runtime.sampler import reject_incompatible_cache
 
@@ -62,6 +62,7 @@ def reconfigure(
     mode = cache_mode if cache_mode is not None else cfg.cache.mode
     strategy: OffloadStrategy = offload_strategy if offload_strategy is not None else cfg.offload.strategy
     reject_incompatible_cache(cfg, mode)
+    reject_release_without_offload(strategy, cfg.text_embedder.release_after_encode)
 
     prev: PipelineConfig | None = getattr(pipe, "config", None)
     if _same_runtime(pipe, cfg, engine, mode, strategy):
@@ -110,11 +111,13 @@ def reconfigure(
     _apply_cache(pipe, cfg.cache, mode, force=dit_replaced or prev is None)
     _reject_block_export(strategy, cfg)
     # Block offload wraps each block forward. Recompile replaces those wrappers.
+    # A release_after_encode change only retargets the text stage on the same handle.
     _apply_offload(
         pipe,
         strategy,
         cfg.offload.pin_memory,
         force=modules_replaced or execution_reapplied,
+        release_text=cfg.text_embedder.release_after_encode,
     )
     attach_profile(pipe, cfg.profile.mode)
     remember(
@@ -171,8 +174,10 @@ def _dit_needs_reload(prev: PipelineConfig | None, cfg: PipelineConfig) -> bool:
 def _text_needs_reload(prev: PipelineConfig | None, cfg: PipelineConfig) -> bool:
     if prev is None:
         return False
+    previous = prev.text_embedder.model_dump(exclude={"release_after_encode"})
+    current = cfg.text_embedder.model_dump(exclude={"release_after_encode"})
     return (
-        prev.text_embedder.model_dump() != cfg.text_embedder.model_dump()
+        previous != current
         or prev.paths.qwen != cfg.paths.qwen
         or prev.paths.clip != cfg.paths.clip
         or prev.dit.text_token_padding != cfg.dit.text_token_padding
@@ -278,19 +283,56 @@ def _reject_block_export(strategy: OffloadStrategy, cfg: PipelineConfig) -> None
         raise ValueError("Block offload supports eager and regional torch.compile, not paths.dit_export")
 
 
-def _apply_offload(pipe, strategy: OffloadStrategy, pin_memory: bool, *, force: bool) -> None:
+def _apply_offload(
+    pipe,
+    strategy: OffloadStrategy,
+    pin_memory: bool,
+    *,
+    force: bool,
+    release_text: bool = False,
+) -> None:
+    reject_release_without_offload(strategy, release_text)
     current_pin = getattr(pipe.offload, "pin_memory", True)
     pin_matters = strategy in ("module", "block")
     unchanged = pipe.offload.strategy == strategy and (not pin_matters or current_pin == pin_memory)
     if unchanged and not force:
+        _sync_text_release(pipe, release_text)
         return
+    if not release_text:
+        _restore_released_text(pipe)
     pipe.offload = build_offload(strategy, pipe.device, pin_memory=pin_memory)
     if strategy == "none":
         return
     for name in _MODULE_NAMES:
         module = getattr(pipe, name, None)
-        if module is not None:
+        if module is None:
+            continue
+        if name == "text_embedder":
+            pipe.offload.register(name, module, release=release_text)
+        else:
             pipe.offload.register(name, module)
+
+
+def _sync_text_release(pipe, release_text: bool) -> None:
+    """Point the existing text stage at drop-on-exit without rebuilding other stages."""
+    text = getattr(pipe, "text_embedder", None)
+    offload = pipe.offload
+    if text is None or not hasattr(offload, "releases"):
+        return
+    if offload.releases("text_embedder") == release_text:
+        return
+    if not release_text:
+        _restore_released_text(pipe)
+    offload.register("text_embedder", text, release=release_text)
+
+
+def _restore_released_text(pipe) -> None:
+    """Bring text weights back when drop-on-exit is turned off and they are gone."""
+    text = getattr(pipe, "text_embedder", None)
+    if text is None or not hasattr(text, "ensure_loaded"):
+        return
+    if getattr(text, "qwen", None) is None or getattr(text, "clip", None) is None:
+        text.ensure_loaded()
 
 
 def _move_modules(pipe, device: torch.device) -> None:
@@ -309,7 +351,8 @@ def _replace_dit(pipe, cfg: PipelineConfig, engine: str, load_device: torch.devi
 
 
 def _replace_text(pipe, cfg: PipelineConfig, load_device: torch.device) -> None:
-    text_device = pipe.device if cfg.text_embedder.quantized_qwen else load_device
+    on_compute = cfg.text_embedder.quantized_qwen or cfg.text_embedder.release_after_encode
+    text_device = pipe.device if on_compute else load_device
     pipe.text_embedder = Kandinsky6TextEmbedder(
         qwen_path=cfg.paths.qwen,
         clip_path=cfg.paths.clip,

@@ -140,8 +140,10 @@ class BlockOffload:
 
     Register the bare DiT or CacheDiT as ``dit``. Other stages stay CPU-resident
     until ``use``; stage-level prefetch hints are deliberately ignored to keep
-    the text encoder and VAEs out of VRAM during denoising. NF4 Qwen, when used,
-    retains its existing device-bound behavior and is *not* block-offloaded.
+    the text encoder and VAEs out of VRAM during denoising. A stage registered
+    with ``release=True`` is loaded on entry and dropped on exit, not swapped
+    through a CUDA slot. NF4 Qwen without that flag keeps its device-bound
+    weights and is not block-offloaded.
     """
 
     strategy = "block"
@@ -171,18 +173,37 @@ class BlockOffload:
         self._stages: dict[str, _TensorGroup] = {}
         self._stage_roots: dict[str, nn.Module] = {}
         self._facades: dict[str, Any] = {}
+        self._release_modules: dict[str, Any] = {}
         self._blocks: list[_TensorGroup] = []
         self._active: set[str] = set()
         self._compute: torch.cuda.Stream | None = None
         self._next_slot = 0
 
     def release(self, *names: str) -> None:
-        """Stage residency ends in ``use``. The pipeline calls this after every request."""
-        del names
+        """Stage residency ends in ``use``. Drop-on-exit modules are dropped here too."""
+        for name in names:
+            module = self._release_modules.get(name)
+            if module is not None:
+                module.release()
 
-    def register(self, name: str, module: Any) -> None:
-        if self._active or name in self._stages:
+    def releases(self, name: str) -> bool:
+        return name in self._release_modules
+
+    def register(self, name: str, module: Any, *, release: bool = False) -> None:
+        if self._active:
             raise RuntimeError(f"Cannot register active or duplicate offload stage: {name}")
+        if name in self._stages or name in self._release_modules:
+            # DiT block forwards are wrapped once. Replacing that stage would
+            # wrap them again. Other stages may change drop-on-exit in place.
+            if name == "dit":
+                raise RuntimeError(f"Cannot register active or duplicate offload stage: {name}")
+            self._stages.pop(name, None)
+            self._stage_roots.pop(name, None)
+            self._facades.pop(name, None)
+            self._release_modules.pop(name, None)
+        if release:
+            self._release_modules[name] = module
+            return
         if name == "dit":
             self._register_dit(module)
             return
@@ -235,14 +256,17 @@ class BlockOffload:
                 block.forward = self._decorate(block.forward, groups[index], following)
 
     def _decorate(self, forward, group: _TensorGroup, following: _TensorGroup | None):
-        @wraps(forward)
+        # Do not copy Dynamo's _torchdynamo_orig_callable from an already
+        # compiled bound method: disable() would unwrap past this residency
+        # wrapper to an UNBOUND forward, losing both self and the H2D hooks.
+        @wraps(forward, updated=())
         def wrapped(*args, **kwargs):
             with self._use_block(group, following):
                 return forward(*args, **kwargs)
 
         # Keep transfer orchestration out of Dynamo; forward itself may already
         # be regionally compiled, and is called with CUDA tensors bound in place.
-        return torch.compiler.disable(wrapped)
+        return torch.compiler.disable(wrapped, recursive=False)
 
     def _prefetch(self, group: _TensorGroup, *, exclude: _Slot | None = None) -> _Slot:
         for slot in self._slots:
@@ -298,41 +322,52 @@ class BlockOffload:
             raise RuntimeError("BlockOffload is inference-only; use torch.no_grad() or inference_mode()")
         if self._active:
             raise RuntimeError("BlockOffload does not support nested/concurrent stage use")
+        release_names = [name for name in names if name in self._release_modules]
+        stage_names = [name for name in names if name not in self._release_modules]
         # SR latent-upscaler banks may materialize another scale on CPU between
         # requests. Register those children before staging, never during forward.
-        for name in names:
+        for name in stage_names:
             if name in self._stage_roots:
                 self._stages[name].add_modules(list(self._stage_roots[name].modules()))
-        groups = [self._stages[name] for name in names]
+        groups = [self._stages[name] for name in stage_names]
+        for name in release_names:
+            module = self._release_modules[name]
+            module.device = self.compute_device
+            module.ensure_loaded()
         self._active = set(names)
-        self._compute = torch.cuda.current_stream(self.compute_device)
         resident: list[_Slot] = []
         try:
-            # Non-block weights live on CUDA only for the enclosing stage.
-            for group in groups:
-                slot = _Slot(staged=False)
-                resident.append(slot)
-                slot.load(group, self._xfer)
-                self._compute.wait_event(slot.ready)
-                group.bind(slot.tensors)
-            for name in names:
-                if name in self._facades:
-                    self._facades[name].device = self.compute_device
+            if stage_names:
+                self._compute = torch.cuda.current_stream(self.compute_device)
+                # Non-block weights live on CUDA only for the enclosing stage.
+                for group in groups:
+                    slot = _Slot(staged=False)
+                    resident.append(slot)
+                    slot.load(group, self._xfer)
+                    self._compute.wait_event(slot.ready)
+                    group.bind(slot.tensors)
+                for name in stage_names:
+                    if name in self._facades:
+                        self._facades[name].device = self.compute_device
             yield
         finally:
-            # Stage boundary (not per block): make cleanup, exceptions, and
-            # immediate reuse on another compute stream safe.
-            self._compute.synchronize()
-            self._xfer.synchronize()
-            for group in (*groups, *self._blocks):
-                group.restore()
-            for slot in (*resident, *self._slots):
-                slot.clear()
-            for name in names:
-                if name in self._facades:
-                    self._facades[name].device = torch.device("cpu")
+            if stage_names:
+                # Stage boundary (not per block): make cleanup, exceptions, and
+                # immediate reuse on another compute stream safe.
+                self._compute.synchronize()
+                self._xfer.synchronize()
+                for group in (*groups, *self._blocks):
+                    group.restore()
+                for slot in (*resident, *self._slots):
+                    slot.clear()
+                for name in stage_names:
+                    if name in self._facades:
+                        self._facades[name].device = torch.device("cpu")
+                self._compute = None
+                self._next_slot = 0
+            for name in release_names:
+                self._release_modules[name].release()
             self._active.clear()
-            self._compute = None
-            self._next_slot = 0
-            with torch.cuda.device(self.compute_device):
-                torch.cuda.empty_cache()
+            if self.compute_device.type == "cuda" and torch.cuda.is_available():
+                with torch.cuda.device(self.compute_device):
+                    torch.cuda.empty_cache()

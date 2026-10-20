@@ -707,9 +707,15 @@ def _component_targets(pipe: object) -> list[tuple[Any, str, str]]:
     rows: list[tuple[Any, str, str]] = []
     text = getattr(pipe, "text_embedder", None)
     if text is not None:
-        if getattr(text, "qwen", None) is not None:
+        # Facade methods survive a drop/reload of the inner modules. Fall back
+        # to the module forward when the embedder has no facade of its own.
+        if hasattr(text, "encode_qwen"):
+            rows.append((text, "encode_qwen", "text_encoder"))
+        elif getattr(text, "qwen", None) is not None:
             rows.append((text.qwen, "forward", "text_encoder"))
-        if getattr(text, "clip", None) is not None:
+        if hasattr(text, "encode_clip"):
+            rows.append((text, "encode_clip", "text_encoder_2"))
+        elif getattr(text, "clip", None) is not None:
             rows.append((text.clip, "forward", "text_encoder_2"))
     dit = getattr(pipe, "dit", None)
     if dit is not None:

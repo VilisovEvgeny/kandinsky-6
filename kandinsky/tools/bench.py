@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import torch
 import yaml
 
 from kandinsky.tools.bench_report import write_module_time_report
@@ -327,10 +328,9 @@ def _median_sample(samples: list[_Sample]) -> _Sample:
     return _Sample(elapsed, ordered[mid].profile)
 
 
+@torch.no_grad()
 def _super_resolve(pipe, result, out: Path) -> None:
     """Saved SR pass. The base pipeline stays loaded for the next resolution."""
-    import torch
-
     from kandinsky.pipeline.sr import load_sr_pipeline
 
     if not pipe.config.sr.enabled:

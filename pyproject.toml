@@ -37,7 +37,7 @@ dependencies = [
     "cyclopts>=4.22.0",
     "diffusers>=0.39.0",
     "huggingface-hub>=1.0",
-    "kandinsky-6-sr>=1.0.0",
+    "kandinsky-6-sr>=1.1.0",
     "librosa>=0.11.0",
     "pydantic>=2.11.0",
     "pyyaml>=6.0.2",
@@ -76,7 +76,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-kandinsky-6-sr = { git = "https://github.com/kandinskylab/kandinsky-6-sr", tag = "v1.0.0" }
+kandinsky-6-sr = { git = "https://github.com/kandinskylab/kandinsky-6-sr", tag = "v1.1.0" }
 flash-attn-3 = { index = "pytorch-cu130" }
 torch = [
     { index = "pytorch-cu130", extra = "hopper" },

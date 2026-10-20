@@ -11,7 +11,7 @@ from ..core.components.vae_audio import build_audio_vae, build_vocoder
 from ..core.components.vae_video import build_vae
 from ..runtime.cache import CacheDiT
 from ..runtime.kernels import bind_attention
-from ..runtime.offload import OffloadHandle, OffloadStrategy, build_offload
+from ..runtime.offload import OffloadHandle, OffloadStrategy, build_offload, reject_release_without_offload
 from ..runtime.profile import attach_profile, diff_launch_overrides
 from ..runtime.sampler import dit_class, reject_incompatible_cache
 from ..runtime.weights import ensure_checkpoint, load_bf16_checkpoint, materialize_meta_buffers
@@ -165,6 +165,7 @@ def _build_pipeline(
     reject_incompatible_cache(cfg, cache_mode)
     off_cfg = cfg.offload
     strategy: OffloadStrategy = offload_strategy if offload_strategy is not None else off_cfg.strategy
+    reject_release_without_offload(strategy, cfg.text_embedder.release_after_encode)
     if strategy == "block" and cfg.paths.dit_export is not None:
         raise ValueError("Block offload supports eager and regional torch.compile, not paths.dit_export")
     offload: OffloadHandle = build_offload(strategy, device, pin_memory=off_cfg.pin_memory)
@@ -179,8 +180,9 @@ def _build_pipeline(
         logger.warning("paths.dit_export is set, so dit.text_token_padding is forced on for a static AOTI text length")
         cfg.dit.text_token_padding = True
 
-    # NF4 Qwen must load on CUDA (bitsandbytes); keep it on compute device even with module offload.
-    text_device = device if cfg.text_embedder.quantized_qwen else load_device
+    # NF4 Qwen must load on CUDA (bitsandbytes). Drop-on-exit reloads on this same device.
+    on_compute = cfg.text_embedder.quantized_qwen or cfg.text_embedder.release_after_encode
+    text_device = device if on_compute else load_device
     text_embedder = Kandinsky6TextEmbedder(
         qwen_path=cfg.paths.qwen,
         clip_path=cfg.paths.clip,
@@ -215,7 +217,11 @@ def _build_pipeline(
     dit = CacheDiT(dit)
 
     if strategy != "none":
-        offload.register("text_embedder", text_embedder)
+        offload.register(
+            "text_embedder",
+            text_embedder,
+            release=cfg.text_embedder.release_after_encode,
+        )
         offload.register("dit", dit)
         offload.register("vae", vae)
         if audio_vae is not None:

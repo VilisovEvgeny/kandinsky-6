@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 import torch
@@ -118,17 +119,34 @@ class Kandinsky6TextEmbedder:
         self.max_length = max_length
         self.device = torch.device(device)
         self.quantized_qwen = quantized_qwen
+        self._qwen_path = qwen_path
+        self._clip_path = clip_path
         # K5 parity: pad to max_length (static shapes for compile/AOTI) + attn mask.
         self.text_token_padding = text_token_padding
+        self.qwen = None
+        self.clip = None
+        self.processor = None
+        self.tokenizer = None
+        self._load_models()
 
-        qwen_kwargs = qwen_load_kwargs(self.device, quantized=quantized_qwen)
+    def _load_models(self) -> None:
+        """Load Qwen and CLIP the same way the first build does."""
+        qwen_kwargs = qwen_load_kwargs(self.device, quantized=self.quantized_qwen)
         self.qwen = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            qwen_path, **qwen_kwargs
+            self._qwen_path, **qwen_kwargs
         ).eval()
-        self.processor = AutoProcessor.from_pretrained(qwen_processor_dir(qwen_path))
+        if self.processor is None:
+            self.processor = AutoProcessor.from_pretrained(qwen_processor_dir(self._qwen_path))
+        self.clip = _load_clip_text_model(self._clip_path).to(self.device).eval()
+        if self.tokenizer is None:
+            self.tokenizer = CLIPTokenizer.from_pretrained(clip_tokenizer_dir(self._clip_path))
 
-        self.clip = _load_clip_text_model(clip_path).to(self.device).eval()
-        self.tokenizer = CLIPTokenizer.from_pretrained(clip_tokenizer_dir(clip_path))
+    def _weights_ready(self) -> bool:
+        if self.qwen is None or self.clip is None:
+            return False
+        qwen_device = getattr(self.qwen, "device", None)
+        clip_device = getattr(self.clip, "device", None)
+        return qwen_device == self.device and clip_device == self.device
 
     @torch.no_grad()
     def encode(
@@ -162,12 +180,7 @@ class Kandinsky6TextEmbedder:
             padding="max_length",
         ).to(self.qwen.device)
 
-        qwen_out = self.qwen(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            return_dict=True,
-            output_hidden_states=True,
-        )
+        qwen_out = self.encode_qwen(inputs["input_ids"], inputs["attention_mask"])
         # (bs, max_length+crop, 3584) → crop system prompt
         embeds = qwen_out["hidden_states"][-1][:, _CROP_START:]  # (bs, max_length, 3584)
         attn = inputs["attention_mask"][:, _CROP_START:]  # (bs, max_length)
@@ -210,20 +223,52 @@ class Kandinsky6TextEmbedder:
             padding="max_length",
             return_tensors="pt",
         ).to(self.clip.device)
-        pooled_embed = self.clip(**clip_inputs)["pooler_output"]  # (bs, 768)
+        pooled_embed = self.encode_clip(clip_inputs)["pooler_output"]  # (bs, 768)
 
+        # Clones do not alias parameter storage, so offload can drop the weights
+        # in the stage's finally while these tensors stay alive.
         embeds_dict: TextEmbeds = {
-            "text_embeds": text_embeds_out.to(self.device),
-            "pooled_embed": pooled_embed.to(self.device),
+            "text_embeds": text_embeds_out.to(self.device).clone(),
+            "pooled_embed": pooled_embed.to(self.device).clone(),
         }
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         return embeds_dict, cu_seqlens.to(self.device), attention_mask
 
+    def encode_qwen(self, input_ids: Tensor, attention_mask: Tensor):
+        """Qwen forward. Profiled as ``text_encoder``; the method outlives a reload."""
+        return self.qwen(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+        )
+
+    def encode_clip(self, clip_inputs):
+        """CLIP forward. Profiled as ``text_encoder_2``; the method outlives a reload."""
+        return self.clip(**clip_inputs)
+
+    def release(self) -> None:
+        """Drop device-bound weights. A later ``ensure_loaded`` builds them again."""
+        if self.qwen is None and self.clip is None:
+            return
+        self.qwen = None
+        self.clip = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def ensure_loaded(self) -> None:
+        """Load weights when they are missing or not on ``self.device``."""
+        if self._weights_ready():
+            return
+        self._load_models()
+
     def to(self, device, non_blocking: bool = False) -> Kandinsky6TextEmbedder:
         self.device = torch.device(device)
         # bitsandbytes NF4 weights are device-bound; moving breaks the quantized modules.
-        if not self.quantized_qwen:
+        if self.qwen is not None and not self.quantized_qwen:
             self.qwen = self.qwen.to(self.device, non_blocking=non_blocking)
-        self.clip = self.clip.to(self.device, non_blocking=non_blocking)
+        if self.clip is not None:
+            self.clip = self.clip.to(self.device, non_blocking=non_blocking)
         return self

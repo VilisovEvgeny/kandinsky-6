@@ -585,8 +585,8 @@ wheels = [
 
 [[package]]
 name = "kandinsky-6-sr"
-version = "1.0.0"
-source = { git = "https://github.com/kandinskylab/kandinsky-6-sr?tag=v1.0.0#607f775d9859c026b9138966a5ecd303f60d205d" }
+version = "1.1.0"
+source = { git = "https://github.com/kandinskylab/kandinsky-6-sr?tag=v1.1.0#b15e2aac526519c51f59dfec2b848355bb8902de" }
 dependencies = [
     { name = "av" },
     { name = "cyclopts" },
@@ -646,7 +646,7 @@ requires-dist = [
     { name = "diffusers", specifier = ">=0.39.0" },
     { name = "flash-attn-3", marker = "extra == 'hopper'", specifier = "==3.0.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "huggingface-hub", specifier = ">=1.0" },
-    { name = "kandinsky-6-sr", git = "https://github.com/kandinskylab/kandinsky-6-sr?tag=v1.0.0" },
+    { name = "kandinsky-6-sr", git = "https://github.com/kandinskylab/kandinsky-6-sr?tag=v1.1.0" },
     { name = "librosa", specifier = ">=0.11.0" },
     { name = "pydantic", specifier = ">=2.11.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
