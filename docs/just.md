@@ -15,3 +15,4 @@ Run every recipe from the repository root. You need [uv](https://docs.astral.sh/
 | `just setup-sglang`, `just generate-sglang`, `just serve-sglang` | [SGLang](quick_start_sglang.md) |
 | `just setup-fastvideo`, `just generate-fastvideo` | [FastVideo](quick_start_fastvideo.md) |
 | `just bench` | Eight native t2v timings on one GPU: SD and Full HD. JSON files go to `profiles/` in the run folder. |
+| `just memfit` | One generation per 16, 24, and 32 GB consumer preset. A driver allocation leaves that much memory free on each GPU. |

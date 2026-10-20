@@ -35,6 +35,14 @@ download NAME *ARGS:
 bench *ARGS:
     @uv run kandy bench {{ARGS}}
 
+# Leave 16, 24, or 32 GB free on each GPU and generate once per consumer preset.
+# cudaMalloc holds the rest outside the PyTorch allocator, so an H100 stands in for that card.
+# Jobs run in parallel, one process per GPU.
+# just memfit
+# just memfit --gpus 0 1
+memfit *ARGS:
+    @uv run kandy memfit {{ARGS}}
+
 # vLLM 0.31.0 and vLLM-Omni main, in .venvs/vllm-omni. Separate from `just setup`.
 setup-vllm:
     #!/usr/bin/env bash

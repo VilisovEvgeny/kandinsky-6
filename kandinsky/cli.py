@@ -7,6 +7,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import cyclopts
 import torch
@@ -280,6 +281,32 @@ def bench(
     from kandinsky.tools.bench import run
 
     raise SystemExit(run(gpu=gpu, prompt=prompt, seed=seed, mem_threshold=mem_threshold))
+
+
+@app.command
+def memfit(
+    *,
+    gpus: Annotated[list[int] | None, cyclopts.Parameter(consume_multiple=True)] = None,
+    prompt: str | None = None,
+    seed: int = 0,
+    mem_threshold: int = 1000,
+) -> None:
+    """Check that consumer presets fit in emulated VRAM.
+
+    The GPUs in this machine stand in for the consumer cards. Each preset in
+    ``kandinsky/configs/devices`` whose comment names 16, 24, or 32 GB is one
+    job. The job ``cudaMalloc``s outside the PyTorch allocator so that much
+    memory stays free, then generates one clip with that preset. Offload,
+    quantization, and the checkpoint come from the preset. SageAttention is
+    used when it is installed; otherwise the job runs on FlashAttention 3 and
+    the command prints the substitution. Jobs run in parallel, one process per
+    GPU. ``--gpus`` selects cards (``--gpus 0 1``). When it is omitted, every
+    free GPU is used. Profile JSON files go to ``profiles/`` inside
+    ``$KANDINSKY_HOME/outputs/memfit_<date-time>/``.
+    """
+    from kandinsky.tools.memfit import run
+
+    raise SystemExit(run(gpus=gpus, prompt=prompt, seed=seed, mem_threshold=mem_threshold))
 
 
 @app.command
