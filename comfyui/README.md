@@ -147,3 +147,13 @@ python -m pip install --force-reinstall --no-deps \
 
 Inference stays on GPU. For another ComfyUI version, match its own
 `comfy-kitchen` requirement rather than forcing this pin.
+
+
+## Community INT8 ConvRot
+[Kandinsky T8](https://registry.comfy.org/nodes/kandinsky-t8) by **T8mars / t8star**
+is a community adaptation with its own [INT8 ConvRot weights](https://huggingface.co/t8star/Kandinsky-Comfy)
+for Lite, Lite Distill and Pro Distill. Install `kandinsky-t8` through ComfyUI Manager
+and follow its [installation guide and bundled workflows](https://github.com/T8mars/Comfyui-Kandinsky-T8).
+
+There is also [kabachuha's native ComfyUI implementation](https://github.com/Comfy-Org/ComfyUI/pull/16825)
+with [INT8 ConvRot Pro/Lite models, including distilled variants](https://huggingface.co/collections/kabachuha/kandinsky-60-quantized-int8-convrot).

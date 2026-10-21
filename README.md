@@ -64,17 +64,37 @@ just generate 'A cat is lying on a mat, turns toward the camera, opens its mouth
 
 ## Performance
 
-Working time (s) for a 5-second clip on the non-distilled model, after warmup. Weight loading and MP4 encoding are excluded. 
+Working time (s) for a 5-second text-to-video clip with audio. Weight loading and MP4 encoding are excluded. The base clip is 480×864. Full HD super-resolved at scale 2.25. Compile is torch. Prompt expansion uses Qwen2.5.
 
-RTX PRO 6000 (96 GB), A100 80 GB, and H100 80 GB use module offload. The consumer cards use block offload.
+Distilled checkpoints use PiFlow, 10 steps. The other checkpoints use 50 steps and MagCache.
 
-RTX 4090, RTX 5060 Ti, RTX 5080, RTX 5090, RTX PRO 6000, and A100 80 GB use SageAttention2++ for visual self-attention. The H100 uses FlashAttention 3. 
+The H100 column is `just bench`: FlashAttention 3, Qwen in BF16, module offload. Each cell is median of three generations.
 
-| | RTX 4090 | RTX 5060 Ti | RTX 5080 | RTX 5090 | RTX PRO 6000 | A100 80 GB | H100 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Lite SD | 437 | 1310 | 577 | 309 | 242 | 532 | 239 |
-| Lite HD | 422 | 1328 | 579 | 296 | 274 | 472 | 203 |
-| Lite Full HD | 578 | 1774 | 770 | 406 | 387 | 664 | 284 |
-| Pro SD | 936 | 3080 | 1336 | 754 | 621 | 972 | 356 |
-| Pro HD | 1194 | 2716 | 1189 | 638 | 561 | 791 | 292 |
-| Pro Full HD | 1247 | 3530 | 1546 | 854 | 765 | 1106 | 402 |
+RTX 4090, RTX 5090, and A100 use SageAttention and Qwen in BF16. Lite stays resident on the RTX 5090 and the A100, and uses module offload on the RTX 4090. Pro uses block offload on the RTX 4090 and the RTX 5090, and module offload on the A100. Each cell is one generation after warmup.
+
+The RTX 5060 Ti uses SageAttention and Qwen in NF4. Lite stays resident. Pro uses block offload. Each cell is one generation after warmup.
+
+| | RTX 4090 24 GB | RTX 5060 Ti 16 GB | RTX 5090 32 GB | A100 80 GB | H100 80 GB |
+|---|---:|---:|---:|---:|---:|
+| Lite Distill SD | 68.0 | 173.7 | 44.2 | 78.6 | 31.2 |
+| Lite Distill Full HD | 208.9 | 608.4 | 140.3 | 207.1 | 78.0 |
+| Lite SD | 267.9 | 834.9 | 201.3 | 371.6 | 143.2 |
+| Lite Full HD | 408.7 | 1286.7 | 296.2 | 508.0 | 192.2 |
+| Pro Distill SD | 235.0 | 717.6 | 174.5 | 236.0 | 87.8 |
+| Pro Distill Full HD | 381.0 | 1153.0 | 269.5 | 375.4 | 133.2 |
+| Pro SD | 955.4 | 3143.6 | 768.0 | 980.4 | 351.5 |
+| Pro Full HD | 1096.7 | 3571.4 | 862.8 | 1109.8 | 399.7 |
+
+Module breakdowns:
+
+- [H100 80 GB](docs/performance/h100.md)
+- [RTX 4090 24 GB](docs/performance/rtx-4090.md)
+- [RTX 5090 32 GB](docs/performance/rtx-5090.md)
+- [A100 80 GB](docs/performance/a100.md)
+
+## Community
+
+- [Kandinsky T8](https://github.com/T8mars/Comfyui-Kandinsky-T8) by [T8mars](https://github.com/T8mars), a ComfyUI adaptation for Lite, Lite Distill, and Pro Distill.
+  - [INT8 ConvRot weights](https://huggingface.co/t8star/Kandinsky-Comfy)
+- [Native ComfyUI implementation](https://github.com/Comfy-Org/ComfyUI/pull/16825) by [kabachuha](https://github.com/kabachuha).
+  - [INT8 ConvRot Pro and Lite weights, including distilled variants](https://huggingface.co/collections/kabachuha/kandinsky-60-quantized-int8-convrot)
